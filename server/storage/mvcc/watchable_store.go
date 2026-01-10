@@ -41,6 +41,17 @@ var (
 
 	// maxResyncPeriod is the period of executing resync.
 	watchResyncPeriod = 100 * time.Millisecond
+
+	// victimBatchSize is the number of victim watchers to process in a single batch.
+	// Processing in smaller batches allows early exit when sends fail, avoiding
+	// wasted CPU cycles on watchers that share a congested channel.
+	victimBatchSize = 32
+
+	// minVictimBackoff is the initial backoff duration when victim sends fail.
+	minVictimBackoff = 10 * time.Millisecond
+
+	// maxVictimBackoff is the maximum backoff duration for victim processing.
+	maxVictimBackoff = 1 * time.Second
 )
 
 func ChanBufLen() int { return chanBufLen }
@@ -59,8 +70,18 @@ type watchableStore struct {
 	// before locking store.mu to avoid deadlock.
 	mu sync.RWMutex
 
-	// victims are watcher batches that were blocked on the watch channel
-	victims []watcherBatch
+	// victims are watchers that were blocked on the watch channel.
+	// This maps each victim watcher to its pending event batch.
+	//
+	// They are called victims because all synced watchers should be able
+	// to send watch responses successfully under normal condition, and
+	// they all share the same stream. So if watcher A succeeds while watcher
+	// B fails due to the shared channel being full, watcher B will become
+	// a victim. However, watcher B's client is not inherently slower than
+	// A's. It's just that B got unlucky due to timing, so we call it a victim.
+	victims watcherBatch
+	// victimc notifies when there are new victims so that next round of
+	// moveVictims() will be executed.
 	victimc chan struct{}
 
 	// contains all unsynced watchers that needs to sync with events that have happened
@@ -180,17 +201,11 @@ func (s *watchableStore) cancelWatcher(wa *watcher) {
 			panic("watcher not victim but not in watch groups")
 		}
 
-		var victimBatch watcherBatch
-		for _, wb := range s.victims {
-			if wb[wa] != nil {
-				victimBatch = wb
-				break
-			}
-		}
-		if victimBatch != nil {
+		// Check if watcher is in the victims map
+		if s.victims != nil && s.victims[wa] != nil {
 			slowWatcherGauge.Dec()
 			watcherGauge.Dec()
-			delete(victimBatch, wa)
+			delete(s.victims, wa)
 			break
 		}
 
@@ -259,10 +274,41 @@ func (s *watchableStore) syncWatchersLoop() {
 func (s *watchableStore) syncVictimsLoop() {
 	defer s.wg.Done()
 
+	currentBackoff := time.Duration(0)
 	for {
-		for s.moveVictims() != 0 {
-			// try to update all victim watchers
+		// Process victims in batches until done or failure
+		var moved int
+		var failed bool
+		for {
+			moved, failed = s.moveVictims()
+			if failed || moved == 0 {
+				break
+			}
 		}
+
+		if failed {
+			// Apply exponential backoff when sends are failing
+			if currentBackoff == 0 {
+				currentBackoff = minVictimBackoff
+			} else {
+				currentBackoff *= 2
+				if currentBackoff > maxVictimBackoff {
+					currentBackoff = maxVictimBackoff
+				}
+			}
+
+			select {
+			case <-time.After(currentBackoff):
+			case <-s.stopc:
+				return
+			}
+			continue
+		}
+
+		// Successfully processed all victims - reset backoff
+		currentBackoff = 0
+
+		// Wait for more victims or signal
 		s.mu.RLock()
 		isEmpty := len(s.victims) == 0
 		s.mu.RUnlock()
@@ -281,61 +327,66 @@ func (s *watchableStore) syncVictimsLoop() {
 	}
 }
 
-// moveVictims tries to update watches with already pending event data
-func (s *watchableStore) moveVictims() (moved int) {
+// moveVictims tries to update watches with already pending event data.
+// It processes victims in small batches and exits early on first send failure
+// to avoid wasting CPU cycles on watchers that share a congested channel.
+// Returns the number of successfully moved watchers and whether a failure occurred.
+func (s *watchableStore) moveVictims() (moved int, failed bool) {
+	// This function holds s.mu lock during the entire processing loop.
+	// This is acceptable because w.send() is non-blocking.
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.victims) == 0 {
+		return 0, false
+	}
+
+	// Take snapshot of all victims
 	victims := s.victims
 	s.victims = nil
-	s.mu.Unlock()
 
-	var newVictim watcherBatch
-	for _, wb := range victims {
-		// try to send responses again
-		for w, eb := range wb {
-			// watcher has observed the store up to, but not including, w.minRev
-			rev := w.minRev - 1
-			if !w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: rev}) {
-				if newVictim == nil {
-					newVictim = make(watcherBatch)
-				}
-				newVictim[w] = eb
-				continue
-			}
-			pendingEventsGauge.Add(float64(len(eb.evs)))
-			moved++
+	s.store.revMu.RLock()
+	curRev := s.store.currentRev
+	s.store.revMu.RUnlock()
+
+	count := 0
+	// Iterate directly over the map, processing up to victimBatchSize watchers
+	for w, eb := range victims {
+		if count >= victimBatchSize {
+			break
 		}
 
-		// assign completed victim watchers to unsync/sync
-		s.mu.Lock()
-		s.store.revMu.RLock()
-		curRev := s.store.currentRev
-		for w, eb := range wb {
-			if newVictim != nil && newVictim[w] != nil {
-				// couldn't send watch response; stays victim
-				continue
-			}
-			w.victim = false
-			if eb.moreRev != 0 {
-				w.minRev = eb.moreRev
-			}
-			if w.minRev <= curRev {
-				s.unsynced.add(w)
-			} else {
-				slowWatcherGauge.Dec()
-				s.synced.add(w)
-			}
+		// watcher has observed the store up to, but not including, w.minRev
+		rev := w.minRev - 1
+		if !w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: rev}) {
+			// Send failed - early exit. If this watcher's channel is congested,
+			// other watchers sharing the same channel will likely also fail.
+			failed = true
+			break
 		}
-		s.store.revMu.RUnlock()
-		s.mu.Unlock()
+
+		pendingEventsGauge.Add(float64(len(eb.evs)))
+		moved++
+		count++
+
+		// Remove from victims and assign to sync/unsync immediately
+		delete(victims, w)
+		w.victim = false
+		if eb.moreRev != 0 {
+			w.minRev = eb.moreRev
+		}
+		if w.minRev <= curRev {
+			s.unsynced.add(w)
+		} else {
+			slowWatcherGauge.Dec()
+			s.synced.add(w)
+		}
 	}
 
-	if len(newVictim) > 0 {
-		s.mu.Lock()
-		s.victims = append(s.victims, newVictim)
-		s.mu.Unlock()
-	}
+	// Put remaining victims back
+	s.addVictims(victims)
 
-	return moved
+	return moved, failed
 }
 
 // syncWatchers syncs unsynced watchers by:
@@ -344,27 +395,37 @@ func (s *watchableStore) moveVictims() (moved int) {
 //  3. use minimum revision to get all key-value pairs and send those events to watchers
 //  4. remove synced watchers in set from unsynced group and move to synced group
 func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) {
+	// Phase 1: Select a batch of watchers to sync (requires lock)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.unsynced.size() == 0 {
+		s.mu.Unlock()
 		return 0, []mvccpb.Event{}
 	}
 
 	s.store.revMu.RLock()
-	defer s.store.revMu.RUnlock()
-
 	// in order to find key-value pairs from unsynced watchers, we need to
 	// find min revision index, and these revisions can be used to
 	// query the backend store of key-value pairs
 	curRev := s.store.currentRev
 	compactionRev := s.store.compactMainRev
-
 	wg, minRev := s.unsynced.choose(maxWatchersPerSync, curRev, compactionRev)
+	s.store.revMu.RUnlock()
+	s.mu.Unlock()
+
+	// Phase 2: Read events from backend storage.
+	// The expensive DB read happens without holding the lock to improve concurrency.
 	evs = rangeEventsWithReuse(s.store.lg, s.store.b, evs, minRev, curRev+1)
 
+	// Phase 3: Process watchers - send events and update unsynced/synced (requires lock)
 	victims := make(watcherBatch)
 	wb := newWatcherBatch(wg, evs)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.store.revMu.RLock()
+	defer s.store.revMu.RUnlock()
+
 	for w := range wg.watchers {
 		if w.minRev < compactionRev {
 			// Skip the watcher that failed to send compacted watch response due to w.ch is full.
@@ -402,13 +463,9 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 		}
 		s.unsynced.delete(w)
 	}
-	s.addVictim(victims)
+	s.addVictims(victims)
 
-	vsz := 0
-	for _, v := range s.victims {
-		vsz += len(v)
-	}
-	slowWatcherGauge.Set(float64(s.unsynced.size() + vsz))
+	slowWatcherGauge.Set(float64(s.unsynced.size() + len(s.victims)))
 
 	return s.unsynced.size(), evs
 }
@@ -459,9 +516,9 @@ func rangeEvents(lg *zap.Logger, b backend.Backend, minRev, maxRev int64) []mvcc
 	// values are actual key-value pairs in backend.
 	tx := b.ReadTx()
 	tx.RLock()
-	revs, vs := tx.UnsafeRange(schema.Key, minBytes, maxBytes, 0)
-	evs := kvsToEvents(lg, revs, vs)
-	// Must unlock after kvsToEvents, because vs (come from boltdb memory) is not deep copy.
+	revs, vals := tx.UnsafeRange(schema.Key, minBytes, maxBytes, 0)
+	evs := kvsToEvents(lg, revs, vals)
+	// Must unlock after kvsToEvents, because vals (come from boltdb memory) is not deep copy.
 	// We can only unlock after Unmarshal, which will do deep copy.
 	// Otherwise we will trigger SIGSEGV during boltdb re-mmap.
 	tx.RUnlock()
@@ -512,14 +569,22 @@ func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
 		// in case 'send' returns false, this is needed for syncWatchers
 		w.minRev = rev + 1
 	}
-	s.addVictim(victim)
+	s.addVictims(victim)
 }
 
-func (s *watchableStore) addVictim(victim watcherBatch) {
-	if len(victim) == 0 {
+// addVictims merges new victims into the victims map.
+// Caller must hold s.mu before calling this function.
+func (s *watchableStore) addVictims(victims watcherBatch) {
+	if len(victims) == 0 {
 		return
 	}
-	s.victims = append(s.victims, victim)
+	if s.victims == nil {
+		s.victims = victims
+	} else {
+		for w, eb := range victims {
+			s.victims[w] = eb
+		}
+	}
 	select {
 	case s.victimc <- struct{}{}:
 	default:
@@ -595,6 +660,9 @@ type watcher struct {
 	ch chan<- WatchResponse
 }
 
+// send puts the watch response into the stream's shared channel.
+// This must finish quickly, otherwise we risk blocking the DB store
+// as a PUT operation involves sending the event to subscribed watchers.
 func (w *watcher) send(wr WatchResponse) bool {
 	progressEvent := len(wr.Events) == 0
 
