@@ -260,15 +260,13 @@ func (s *watchableStore) retryLoop() {
 		var failed bool
 		for {
 			moved, failed = s.retryPendingEvents()
-			if moved > 0 {
-				// Successfully sent some events - reset backoff immediately.
-				// This ensures we don't penalize for a single failure after
-				// multiple successful batches.
-				currentBackoff = 0
-			}
 			if failed || moved == 0 {
 				break
 			}
+			// Successfully sent a full batch of events. Reset backoff immediately.
+			// This ensures we don't penalize for a single failure after
+			// multiple successful batches.
+			currentBackoff = 0
 		}
 
 		if failed {
@@ -293,6 +291,7 @@ func (s *watchableStore) retryLoop() {
 
 		// Successfully processed all pending events - reset backoff
 		currentBackoff = 0
+		s.lg.Info("Sent all pending unsynced watchers")
 
 		// Wait for signal that there are watchers with pending events
 		select {
@@ -378,22 +377,25 @@ func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 // Note: This function only processes watchers with nil eventBatch (Type 1: need DB fetch).
 // Watchers with non-nil eventBatch (Type 2: have pending events) are handled by retryLoop.
 func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) {
-	// Phase 1: Select a batch of watchers to sync (requires lock)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.unsynced.size() == 0 {
-		s.mu.Unlock()
 		return 0, []mvccpb.Event{}
 	}
 
+	// Only hold store.revMu briefly to snapshot revision values. We don't need to hold it
+	// throughout the function because: (1) if curRev increases during processing,
+	// we just process up to our captured value and newer events will be handled in
+	// the next sync cycle, and (2) the lock ordering (s.mu before revMu) is consistent
+	// with the write path, so there's no deadlock risk.
 	s.store.revMu.RLock()
-	// in order to find key-value pairs from unsynced watchers, we need to
-	// find min revision index, and these revisions can be used to
-	// query the backend store of key-value pairs
 	curRev := s.store.currentRev
 	compactionRev := s.store.compactMainRev
-	wg, minRev := s.unsynced.selectForSync(maxWatchersPerSync, curRev, compactionRev)
 	s.store.revMu.RUnlock()
-	s.mu.Unlock()
+
+	// Select a batch of watchers that need DB fetch (nil eventBatch)
+	wg, minRev := s.unsynced.selectForSync(maxWatchersPerSync, curRev, compactionRev)
 
 	// If no watchers need DB fetch (all have pending events), return early
 	if wg == nil {
@@ -401,25 +403,22 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 		return s.unsynced.size(), evs
 	}
 
-	// Phase 2: Read events from backend storage.
-	// The expensive DB read happens without holding the lock to improve concurrency.
+	// Read events from backend storage.
+	// This DB operation can be expensive, but we hold s.mu throughout the entire function
+	// to avoid race conditions. This is acceptable because syncWatchers is called at most
+	// once per watchResyncPeriod (100ms), so the lock contention is minimal.
 	evs = rangeEventsWithReuse(s.store.lg, s.store.b, evs, minRev, curRev+1)
 	s.lg.Info(fmt.Sprintf("minRev: %d, maxRev: %d", minRev, curRev+1))
 
-	// Phase 3: Process watchers - send events and update unsynced/synced (requires lock)
+	// Match events to watchers
 	wb := newWatcherBatch(wg, evs)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.store.revMu.RLock()
-	defer s.store.revMu.RUnlock()
 
 	var hasPendingEvents bool
 	noExistingEb := 0
-	for w, existingEb := range wg.watchers {
-		// Skip watchers that already have pending events (they're handled by retryLoop)
-		if existingEb != nil {
+	for w := range wg.watchers {
+		// Double-check watcher still has no pending events
+		// (shouldn't happen with single lock, but keep for safety)
+		if eb := s.unsynced.watchers[w]; eb != nil {
 			continue
 		}
 
