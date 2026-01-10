@@ -15,6 +15,7 @@
 package mvcc
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -42,16 +43,16 @@ var (
 	// maxResyncPeriod is the period of executing resync.
 	watchResyncPeriod = 100 * time.Millisecond
 
-	// victimBatchSize is the number of victim watchers to process in a single batch.
+	// retryBatchSize is the number of watchers with pending events to process in a single batch.
 	// Processing in smaller batches allows early exit when sends fail, avoiding
 	// wasted CPU cycles on watchers that share a congested channel.
-	victimBatchSize = 32
+	retryBatchSize = 32
 
-	// minVictimBackoff is the initial backoff duration when victim sends fail.
-	minVictimBackoff = 10 * time.Millisecond
+	// minRetryBackoff is the initial backoff duration when sends fail.
+	minRetryBackoff = 10 * time.Millisecond
 
-	// maxVictimBackoff is the maximum backoff duration for victim processing.
-	maxVictimBackoff = 1 * time.Second
+	// maxRetryBackoff is the maximum backoff duration for retry processing.
+	maxRetryBackoff = 1 * time.Second
 )
 
 func ChanBufLen() int { return chanBufLen }
@@ -70,26 +71,18 @@ type watchableStore struct {
 	// before locking store.mu to avoid deadlock.
 	mu sync.RWMutex
 
-	// victims are watchers that were blocked on the watch channel.
-	// This maps each victim watcher to its pending event batch.
-	//
-	// They are called victims because all synced watchers should be able
-	// to send watch responses successfully under normal condition, and
-	// they all share the same stream. So if watcher A succeeds while watcher
-	// B fails due to the shared channel being full, watcher B will become
-	// a victim. However, watcher B's client is not inherently slower than
-	// A's. It's just that B got unlucky due to timing, so we call it a victim.
-	victims watcherBatch
-	// victimc notifies when there are new victims so that next round of
-	// moveVictims() will be executed.
-	victimc chan struct{}
-
-	// contains all unsynced watchers that needs to sync with events that have happened
+	// unsynced contains all watchers that need to catch up with the store's progress.
+	// This includes:
+	// - Watchers with nil eventBatch: need to fetch events from DB
+	// - Watchers with non-nil eventBatch: have events ready to retry sending
 	unsynced watcherGroup
 
-	// contains all synced watchers that are in sync with the progress of the store.
-	// The key of the map is the key that the watcher watches on.
+	// synced contains all watchers that are in sync with the progress of the store.
+	// Watchers in synced always have nil eventBatch.
 	synced watcherGroup
+
+	// retryc signals when there are watchers with pending events that need retry.
+	retryc chan struct{}
 
 	stopc chan struct{}
 	wg    sync.WaitGroup
@@ -105,7 +98,7 @@ func New(lg *zap.Logger, b backend.Backend, le lease.Lessor, cfg StoreConfig) Wa
 	s := newWatchableStore(lg, b, le, cfg)
 	s.wg.Add(2)
 	go s.syncWatchersLoop()
-	go s.syncVictimsLoop()
+	go s.retryLoop()
 	return s
 }
 
@@ -115,7 +108,7 @@ func newWatchableStore(lg *zap.Logger, b backend.Backend, le lease.Lessor, cfg S
 	}
 	s := &watchableStore{
 		store:    NewStore(lg, b, le, cfg),
-		victimc:  make(chan struct{}, 1),
+		retryc:   make(chan struct{}, 1),
 		unsynced: newWatcherGroup(),
 		synced:   newWatcherGroup(),
 		stopc:    make(chan struct{}),
@@ -177,45 +170,29 @@ func (s *watchableStore) watch(key, end []byte, startRev int64, id WatchID, ch c
 	return wa, func() { s.cancelWatcher(wa) }
 }
 
-// cancelWatcher removes references of the watcher from the watchableStore
+// cancelWatcher removes references of the watcher from the watchableStore.
+//
+// Unlike the old design where watchers could temporarily be in a separate "victims"
+// map during processing (requiring retry loops), the new design keeps all watchers
+// in either synced or unsynced groups at all times. Watchers with pending events
+// are stored in unsynced with a non-nil eventBatch. This guarantees that under
+// s.mu lock, a watcher is always findable in one of the two groups.
 func (s *watchableStore) cancelWatcher(wa *watcher) {
-	for {
-		s.mu.Lock()
-		if s.unsynced.delete(wa) {
-			slowWatcherGauge.Dec()
-			watcherGauge.Dec()
-			break
-		} else if s.synced.delete(wa) {
-			watcherGauge.Dec()
-			break
-		} else if wa.ch == nil {
-			// already canceled (e.g., cancel/close race)
-			break
-		} else if wa.compacted {
-			watcherGauge.Dec()
-			break
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		if !wa.victim {
-			s.mu.Unlock()
-			panic("watcher not victim but not in watch groups")
-		}
-
-		// Check if watcher is in the victims map
-		if s.victims != nil && s.victims[wa] != nil {
-			slowWatcherGauge.Dec()
-			watcherGauge.Dec()
-			delete(s.victims, wa)
-			break
-		}
-
-		// victim being processed so not accessible; retry
-		s.mu.Unlock()
-		time.Sleep(time.Millisecond)
+	if s.unsynced.delete(wa) {
+		slowWatcherGauge.Dec()
+		watcherGauge.Dec()
+	} else if s.synced.delete(wa) {
+		watcherGauge.Dec()
+	} else if wa.compacted {
+		watcherGauge.Dec()
 	}
+	// If watcher not found in either group and not compacted,
+	// it was already canceled (e.g., cancel/close race where wa.ch == nil)
 
 	wa.ch = nil
-	s.mu.Unlock()
 }
 
 func (s *watchableStore) Restore(b backend.Backend) error {
@@ -250,7 +227,9 @@ func (s *watchableStore) syncWatchersLoop() {
 
 		unsyncedWatchers := 0
 		if lastUnsyncedWatchers > 0 {
+			s.lg.Info(fmt.Sprintf("Doing watcher synchronization with %d events and %d unsynced watchers", len(evs), lastUnsyncedWatchers))
 			unsyncedWatchers, evs = s.syncWatchers(evs)
+			s.lg.Info(fmt.Sprintf("Done watcher synchronization with %d events and %d unsynced watchers", len(evs), unsyncedWatchers))
 		}
 		syncDuration := time.Since(st)
 
@@ -269,18 +248,24 @@ func (s *watchableStore) syncWatchersLoop() {
 	}
 }
 
-// syncVictimsLoop tries to write precomputed watcher responses to
-// watchers that had a blocked watcher channel
-func (s *watchableStore) syncVictimsLoop() {
+// retryLoop retries sending events to watchers that have pending event batches.
+// These are watchers in unsynced group with non-nil eventBatch.
+func (s *watchableStore) retryLoop() {
 	defer s.wg.Done()
 
 	currentBackoff := time.Duration(0)
 	for {
-		// Process victims in batches until done or failure
+		// Process pending events in batches until done or failure
 		var moved int
 		var failed bool
 		for {
-			moved, failed = s.moveVictims()
+			moved, failed = s.retryPendingEvents()
+			if moved > 0 {
+				// Successfully sent some events - reset backoff immediately.
+				// This ensures we don't penalize for a single failure after
+				// multiple successful batches.
+				currentBackoff = 0
+			}
 			if failed || moved == 0 {
 				break
 			}
@@ -289,14 +274,15 @@ func (s *watchableStore) syncVictimsLoop() {
 		if failed {
 			// Apply exponential backoff when sends are failing
 			if currentBackoff == 0 {
-				currentBackoff = minVictimBackoff
+				currentBackoff = minRetryBackoff
 			} else {
 				currentBackoff *= 2
-				if currentBackoff > maxVictimBackoff {
-					currentBackoff = maxVictimBackoff
+				if currentBackoff > maxRetryBackoff {
+					currentBackoff = maxRetryBackoff
 				}
 			}
 
+			s.lg.Info(fmt.Sprintf("backing off for %v time", currentBackoff))
 			select {
 			case <-time.After(currentBackoff):
 			case <-s.stopc:
@@ -305,58 +291,46 @@ func (s *watchableStore) syncVictimsLoop() {
 			continue
 		}
 
-		// Successfully processed all victims - reset backoff
+		// Successfully processed all pending events - reset backoff
 		currentBackoff = 0
 
-		// Wait for more victims or signal
-		s.mu.RLock()
-		isEmpty := len(s.victims) == 0
-		s.mu.RUnlock()
-
-		var tickc <-chan time.Time
-		if !isEmpty {
-			tickc = time.After(10 * time.Millisecond)
-		}
-
+		// Wait for signal that there are watchers with pending events
 		select {
-		case <-tickc:
-		case <-s.victimc:
+		case <-s.retryc:
 		case <-s.stopc:
 			return
 		}
 	}
 }
 
-// moveVictims tries to update watches with already pending event data.
-// It processes victims in small batches and exits early on first send failure
+// retryPendingEvents tries to send events to watchers that have pending event batches.
+// It processes watchers in small batches and exits early on first send failure
 // to avoid wasting CPU cycles on watchers that share a congested channel.
-// Returns the number of successfully moved watchers and whether a failure occurred.
-func (s *watchableStore) moveVictims() (moved int, failed bool) {
+// Returns the number of successfully processed watchers and whether a failure occurred.
+func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 	// This function holds s.mu lock during the entire processing loop.
 	// This is acceptable because w.send() is non-blocking.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if len(s.victims) == 0 {
-		return 0, false
-	}
-
-	// Take snapshot of all victims
-	victims := s.victims
-	s.victims = nil
 
 	s.store.revMu.RLock()
 	curRev := s.store.currentRev
 	s.store.revMu.RUnlock()
 
 	count := 0
-	// Iterate directly over the map, processing up to victimBatchSize watchers
-	for w, eb := range victims {
-		if count >= victimBatchSize {
+	movedToSynced := 0
+	stayUnsynced := 0
+	// Iterate over unsynced watchers looking for those with pending events
+	for w, eb := range s.unsynced.watchers {
+		if eb == nil {
+			// No pending events - skip (handled by syncWatchers)
+			continue
+		}
+		if count >= retryBatchSize {
 			break
 		}
 
-		// watcher has observed the store up to, but not including, w.minRev
+		// Try to send the pending events
 		rev := w.minRev - 1
 		if !w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: rev}) {
 			// Send failed - early exit. If this watcher's channel is congested,
@@ -369,31 +343,40 @@ func (s *watchableStore) moveVictims() (moved int, failed bool) {
 		moved++
 		count++
 
-		// Remove from victims and assign to sync/unsync immediately
-		delete(victims, w)
-		w.victim = false
+		// Update minRev if there are more events beyond this batch.
+		// If moreRev == 0, minRev is already correct (set by syncWatchers/notify)
+		// and should NOT be updated to curRev+1, because the watcher may need
+		// to catch up on events that happened while it was in unsynced.
 		if eb.moreRev != 0 {
 			w.minRev = eb.moreRev
 		}
+
+		// Clear pending events and determine next state
 		if w.minRev <= curRev {
-			s.unsynced.add(w)
+			// Still behind - stay in unsynced but clear eventBatch for DB fetch
+			s.unsynced.watchers[w] = nil
+			stayUnsynced++
 		} else {
-			slowWatcherGauge.Dec()
+			// Caught up - move to synced
+			s.unsynced.delete(w)
 			s.synced.add(w)
+			slowWatcherGauge.Dec()
+			movedToSynced++
 		}
 	}
-
-	// Put remaining victims back
-	s.addVictims(victims)
+	s.lg.Info(fmt.Sprintf("Moving %d to synced, %d still unsynced, failed sending: %v", movedToSynced, stayUnsynced, failed))
 
 	return moved, failed
 }
 
 // syncWatchers syncs unsynced watchers by:
-//  1. choose a set of watchers from the unsynced watcher group
+//  1. choose a set of watchers from the unsynced watcher group (only those with nil eventBatch)
 //  2. iterate over the set to get the minimum revision and remove compacted watchers
 //  3. use minimum revision to get all key-value pairs and send those events to watchers
 //  4. remove synced watchers in set from unsynced group and move to synced group
+//
+// Note: This function only processes watchers with nil eventBatch (Type 1: need DB fetch).
+// Watchers with non-nil eventBatch (Type 2: have pending events) are handled by retryLoop.
 func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) {
 	// Phase 1: Select a batch of watchers to sync (requires lock)
 	s.mu.Lock()
@@ -408,16 +391,22 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 	// query the backend store of key-value pairs
 	curRev := s.store.currentRev
 	compactionRev := s.store.compactMainRev
-	wg, minRev := s.unsynced.choose(maxWatchersPerSync, curRev, compactionRev)
+	wg, minRev := s.unsynced.selectForSync(maxWatchersPerSync, curRev, compactionRev)
 	s.store.revMu.RUnlock()
 	s.mu.Unlock()
+
+	// If no watchers need DB fetch (all have pending events), return early
+	if wg == nil {
+		s.lg.Info("syncWatchers early return")
+		return s.unsynced.size(), evs
+	}
 
 	// Phase 2: Read events from backend storage.
 	// The expensive DB read happens without holding the lock to improve concurrency.
 	evs = rangeEventsWithReuse(s.store.lg, s.store.b, evs, minRev, curRev+1)
+	s.lg.Info(fmt.Sprintf("minRev: %d, maxRev: %d", minRev, curRev+1))
 
 	// Phase 3: Process watchers - send events and update unsynced/synced (requires lock)
-	victims := make(watcherBatch)
 	wb := newWatcherBatch(wg, evs)
 
 	s.mu.Lock()
@@ -426,7 +415,14 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 	s.store.revMu.RLock()
 	defer s.store.revMu.RUnlock()
 
-	for w := range wg.watchers {
+	var hasPendingEvents bool
+	noExistingEb := 0
+	for w, existingEb := range wg.watchers {
+		// Skip watchers that already have pending events (they're handled by retryLoop)
+		if existingEb != nil {
+			continue
+		}
+
 		if w.minRev < compactionRev {
 			// Skip the watcher that failed to send compacted watch response due to w.ch is full.
 			// Next retry of syncWatchers would try to resend the compacted watch response to w.ch
@@ -446,26 +442,32 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 			w.minRev = eb.moreRev
 		}
 
+		noExistingEb++
 		if w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: curRev}) {
 			pendingEventsGauge.Add(float64(len(eb.evs)))
-		} else {
-			w.victim = true
-		}
-
-		if w.victim {
-			victims[w] = eb
-		} else {
 			if eb.moreRev != 0 {
-				// stay unsynced; more to read
+				// stay unsynced; more to read (eventBatch stays nil)
 				continue
 			}
 			s.synced.add(w)
+			s.unsynced.delete(w)
+		} else {
+			// Send failed - keep in unsynced with pending events for retry
+			s.unsynced.watchers[w] = eb
+			hasPendingEvents = true
 		}
-		s.unsynced.delete(w)
 	}
-	s.addVictims(victims)
+	s.lg.Info(fmt.Sprintf("syncing %d watchers out of %d", noExistingEb, len(wg.watchers)))
 
-	slowWatcherGauge.Set(float64(s.unsynced.size() + len(s.victims)))
+	// Signal the retry loop if there are watchers with pending events
+	if hasPendingEvents {
+		select {
+		case s.retryc <- struct{}{}:
+		default:
+		}
+	}
+
+	slowWatcherGauge.Set(float64(s.unsynced.size()))
 
 	return s.unsynced.size(), evs
 }
@@ -547,7 +549,7 @@ func kvsToEvents(lg *zap.Logger, revs, vals [][]byte) (evs []mvccpb.Event) {
 // notify notifies the fact that given event at the given rev just happened to
 // watchers that watch on the key of the event.
 func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
-	victim := make(watcherBatch)
+	var hasPendingEvents bool
 	for w, eb := range newWatcherBatch(&s.synced, evs) {
 		if eb.revs != 1 {
 			s.store.lg.Panic(
@@ -558,36 +560,24 @@ func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
 		if w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: rev}) {
 			pendingEventsGauge.Add(float64(len(eb.evs)))
 		} else {
-			// move slow watcher to victims
-			w.victim = true
-			victim[w] = eb
+			// Move slow watcher to unsynced with its pending events.
+			// The retryLoop will retry sending these events.
 			s.synced.delete(w)
+			s.unsynced.addWithEventBatch(w, eb)
 			slowWatcherGauge.Inc()
+			hasPendingEvents = true
 		}
 		// always update minRev
 		// in case 'send' returns true and watcher stays synced, this is needed for Restore when all watchers become unsynced
-		// in case 'send' returns false, this is needed for syncWatchers
+		// in case 'send' returns false, this is needed for retry in retryLoop
 		w.minRev = rev + 1
 	}
-	s.addVictims(victim)
-}
-
-// addVictims merges new victims into the victims map.
-// Caller must hold s.mu before calling this function.
-func (s *watchableStore) addVictims(victims watcherBatch) {
-	if len(victims) == 0 {
-		return
-	}
-	if s.victims == nil {
-		s.victims = victims
-	} else {
-		for w, eb := range victims {
-			s.victims[w] = eb
+	// Signal the retry loop if there are watchers with pending events
+	if hasPendingEvents {
+		select {
+		case s.retryc <- struct{}{}:
+		default:
 		}
-	}
-	select {
-	case s.victimc <- struct{}{}:
-	default:
 	}
 }
 
@@ -634,9 +624,6 @@ type watcher struct {
 	// end indicates the end of the range to watch.
 	// If end is set, the watcher is on a range.
 	end []byte
-
-	// victim is set when ch is blocked and undergoing victim processing
-	victim bool
 
 	// compacted is set when the watcher is removed because of compaction
 	compacted bool
