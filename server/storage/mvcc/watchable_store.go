@@ -170,7 +170,7 @@ func (s *watchableStore) watch(key, end []byte, startRev int64, id WatchID, ch c
 	return wa, func() { s.cancelWatcher(wa) }
 }
 
-// cancelWatcher removes references of the watcher from the watchableStore.
+// cancelWatcher removes references of the watcher from the watchableStore
 //
 // Unlike the old design where watchers could temporarily be in a separate "victims"
 // map during processing (requiring retry loops), the new design keeps all watchers
@@ -264,13 +264,11 @@ func (s *watchableStore) retryLoop() {
 				break
 			}
 			// Successfully sent a full batch of events. Reset backoff immediately.
-			// This ensures we don't penalize for a single failure after
-			// multiple successful batches.
 			currentBackoff = 0
 		}
 
 		if failed {
-			// Apply exponential backoff when sends are failing
+			// Apply exponential backoff when sends are failing due to congestion
 			if currentBackoff == 0 {
 				currentBackoff = minRetryBackoff
 			} else {
@@ -316,7 +314,6 @@ func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 	curRev := s.store.currentRev
 	s.store.revMu.RUnlock()
 
-	count := 0
 	movedToSynced := 0
 	stayUnsynced := 0
 	// Iterate over unsynced watchers looking for those with pending events
@@ -325,7 +322,7 @@ func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 			// No pending events - skip (handled by syncWatchers)
 			continue
 		}
-		if count >= retryBatchSize {
+		if moved >= retryBatchSize {
 			break
 		}
 
@@ -340,12 +337,9 @@ func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 
 		pendingEventsGauge.Add(float64(len(eb.evs)))
 		moved++
-		count++
 
 		// Update minRev if there are more events beyond this batch.
 		// If moreRev == 0, minRev is already correct (set by syncWatchers/notify)
-		// and should NOT be updated to curRev+1, because the watcher may need
-		// to catch up on events that happened while it was in unsynced.
 		if eb.moreRev != 0 {
 			w.minRev = eb.moreRev
 		}
@@ -364,18 +358,15 @@ func (s *watchableStore) retryPendingEvents() (moved int, failed bool) {
 		}
 	}
 	s.lg.Info(fmt.Sprintf("Moving %d to synced, %d still unsynced, failed sending: %v", movedToSynced, stayUnsynced, failed))
-
 	return moved, failed
 }
 
 // syncWatchers syncs unsynced watchers by:
-//  1. choose a set of watchers from the unsynced watcher group (only those with nil eventBatch)
+//  1. choose a set of watchers (with nil eventBatch) from the unsynced watcher group.
+//     Note: those with watch events will be handled by retryLoop to resend responses.
 //  2. iterate over the set to get the minimum revision and remove compacted watchers
 //  3. use minimum revision to get all key-value pairs and send those events to watchers
 //  4. remove synced watchers in set from unsynced group and move to synced group
-//
-// Note: This function only processes watchers with nil eventBatch (Type 1: need DB fetch).
-// Watchers with non-nil eventBatch (Type 2: have pending events) are handled by retryLoop.
 func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -390,12 +381,15 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 	// the next sync cycle, and (2) the lock ordering (s.mu before revMu) is consistent
 	// with the write path, so there's no deadlock risk.
 	s.store.revMu.RLock()
+	// in order to find key-value pairs from unsynced watchers, we need to
+	// find min revision index, and these revisions can be used to
+	// query the backend store of key-value pairs
 	curRev := s.store.currentRev
 	compactionRev := s.store.compactMainRev
 	s.store.revMu.RUnlock()
 
-	// Select a batch of watchers that need DB fetch (nil eventBatch)
-	wg, minRev := s.unsynced.selectForSync(maxWatchersPerSync, curRev, compactionRev)
+	// Select a batch of watchers that need DB fetch
+	wg, minRev, maxRev := s.unsynced.selectForSync(maxWatchersPerSync, curRev, compactionRev)
 
 	// If no watchers need DB fetch (all have pending events), return early
 	if wg == nil {
@@ -407,8 +401,9 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 	// This DB operation can be expensive, but we hold s.mu throughout the entire function
 	// to avoid race conditions. This is acceptable because syncWatchers is called at most
 	// once per watchResyncPeriod (100ms), so the lock contention is minimal.
-	evs = rangeEventsWithReuse(s.store.lg, s.store.b, evs, minRev, curRev+1)
-	s.lg.Info(fmt.Sprintf("minRev: %d, maxRev: %d", minRev, curRev+1))
+	// Use maxRev+1 because rangeEventsWithReuse uses exclusive upper bound [minRev, maxRev).
+	evs = rangeEventsWithReuse(s.store.lg, s.store.b, evs, minRev, maxRev+1)
+	s.lg.Info(fmt.Sprintf("minRev: %d, maxRev: %d", minRev, maxRev+1))
 
 	// Match events to watchers
 	wb := newWatcherBatch(wg, evs)
@@ -427,13 +422,19 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 			// Next retry of syncWatchers would try to resend the compacted watch response to w.ch
 			continue
 		}
-		w.minRev = max(curRev+1, w.minRev)
+		// Update minRev to maxRev+1 since we only fetched events up to maxRev
+		w.minRev = max(maxRev+1, w.minRev)
 
 		eb, ok := wb[w]
 		if !ok {
-			// bring un-notified watcher to synced
-			s.synced.add(w)
-			s.unsynced.delete(w)
+			// No events matched this watcher in the fetched range.
+			// Only move to synced if we've caught up to curRev.
+			// Otherwise, stay in unsynced to continue catching up in next cycle.
+			if maxRev >= curRev {
+				s.synced.add(w)
+				s.unsynced.delete(w)
+			}
+			// If maxRev < curRev, watcher stays in unsynced with updated minRev
 			continue
 		}
 
@@ -442,14 +443,15 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 		}
 
 		noExistingEb++
-		if w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: curRev}) {
+		// Use maxRev as the response revision since that's the last revision we fetched
+		if w.send(WatchResponse{WatchID: w.id, Events: eb.evs, Revision: maxRev}) {
 			pendingEventsGauge.Add(float64(len(eb.evs)))
-			if eb.moreRev != 0 {
-				// stay unsynced; more to read (eventBatch stays nil)
-				continue
+			// Only move to synced if we've caught up to curRev and no more events to read
+			if eb.moreRev == 0 && maxRev >= curRev {
+				s.synced.add(w)
+				s.unsynced.delete(w)
 			}
-			s.synced.add(w)
-			s.unsynced.delete(w)
+			// If maxRev < curRev or moreRev != 0, stay unsynced to continue catching up
 		} else {
 			// Send failed - keep in unsynced with pending events for retry
 			s.unsynced.watchers[w] = eb
@@ -467,7 +469,6 @@ func (s *watchableStore) syncWatchers(evs []mvccpb.Event) (int, []mvccpb.Event) 
 	}
 
 	slowWatcherGauge.Set(float64(s.unsynced.size()))
-
 	return s.unsynced.size(), evs
 }
 
@@ -568,7 +569,7 @@ func (s *watchableStore) notify(rev int64, evs []mvccpb.Event) {
 		}
 		// always update minRev
 		// in case 'send' returns true and watcher stays synced, this is needed for Restore when all watchers become unsynced
-		// in case 'send' returns false, this is needed for retry in retryLoop
+		// in case 'send' returns false, this is needed for retryLoop
 		w.minRev = rev + 1
 	}
 	// Signal the retry loop if there are watchers with pending events
@@ -649,6 +650,7 @@ type watcher struct {
 // send puts the watch response into the stream's shared channel.
 // This must finish quickly, otherwise we risk blocking the DB store
 // as a PUT operation involves sending the event to subscribed watchers.
+// And retryPendingEvents also requires this to be non-blocking.
 func (w *watcher) send(wr WatchResponse) bool {
 	progressEvent := len(wr.Events) == 0
 

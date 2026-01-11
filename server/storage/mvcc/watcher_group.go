@@ -121,13 +121,6 @@ func (w watcherSet) union(ws watcherSet) {
 	}
 }
 
-func (w watcherSet) delete(wa *watcher) {
-	if _, ok := w[wa]; !ok {
-		panic("removing missing watcher!")
-	}
-	delete(w, wa)
-}
-
 type watcherSetByKey map[string]watcherSet
 
 func (w watcherSetByKey) add(wa *watcher) {
@@ -246,38 +239,37 @@ func (wg *watcherGroup) delete(wa *watcher) bool {
 // It also handles compacted watchers by sending compaction responses and removing them.
 //
 // To prevent slow watchers from causing large DB queries, this uses revision-range batching:
-// 1. First pass: find the global minimum revision among eligible watchers
-// 2. Second pass: only select watchers within [globalMin, globalMin + selectForSyncRevRange]
-// This ensures oldest watchers are fully drained before moving to newer ones.
+// 1. First filtering: find all eligible watchers and get the global minimum revision among them;
+// 2. Second filtering: only select watchers within [globalMin, globalMin + selectForSyncRevRange]
+// This ensures oldest watchers are fully drained before moving on to newer ones.
 //
-// Returns the selected watchers and the minimum revision needed for DB fetch.
-// If no watchers need sync, returns (nil, MaxInt64).
-func (wg *watcherGroup) selectForSync(maxWatchers int, curRev, compactRev int64) (*watcherGroup, int64) {
-	// Congestion check: If ANY watcher has pending events, return early.
+// Returns the selected watchers and the revision range [minRev, maxRev] needed for DB fetch.
+// If no watchers need sync, returns (nil, MaxInt64, 0).
+func (wg *watcherGroup) selectForSync(maxWatchers int, curRev, compactRev int64) (*watcherGroup, int64, int64) {
+	// Congestion check: If any watcher has pending events, return early.
 	// Only fetch from DB when congestion is totally gone.
 	// This prevents wasting database I/O when events can't be sent anyway.
 	for _, eb := range wg.watchers {
 		if eb != nil {
 			fmt.Printf("selected 0 for sync (congestion: watchers have pending events)\n")
-			return nil, int64(math.MaxInt64)
+			return nil, int64(math.MaxInt64), 0
 		}
 	}
 
-	// First pass: collect eligible watchers and find global minimum revision
+	// First filtering: collect eligible watchers and find global minimum revision
 	globalMinRev := int64(math.MaxInt64)
 	var eligibleWatchers []*watcher
-
-	for w, eb := range wg.watchers {
-		// shouldn't happen after congestion check, but we'd like being defensive
-		if eb != nil {
-			continue
-		}
+	for w := range wg.watchers {
 		if w.minRev > curRev {
+			// After network partition, possibly choosing future revision watcher from restore operation.
+			// Do not panic when such watcher has been moved from "synced" watcher during restore operation.
+			// These watchers will be included in the batch but won't match any events, and will be
+			// moved back to synced group.
 			if !w.restore {
-				panic(fmt.Errorf("watcher minimum revision %d should not exceed current revision %d", w.minRev, curRev))
+				panic(fmt.Errorf("watcher (ID: %d) minimum revision %d should not exceed current revision %d", w.id, w.minRev, curRev))
 			}
 			w.restore = false
-			continue
+			// Don't skip - include in batch so it can be moved to synced when no events match
 		}
 		if w.minRev < compactRev {
 			select {
@@ -297,14 +289,18 @@ func (wg *watcherGroup) selectForSync(maxWatchers int, curRev, compactRev int64)
 
 	if len(eligibleWatchers) == 0 {
 		fmt.Printf("selected 0 for sync (no eligible watchers)\n")
-		return nil, globalMinRev
+		return nil, globalMinRev, 0
 	}
 
-	maxRevForBatch := globalMinRev + selectForSyncRevRange
+	// Limit the revision range to prevent fetching too many events at once.
+	// This bounds the DB query to [globalMinRev, maxAllowedRev].
+	maxAllowedRev := globalMinRev + selectForSyncRevRange
+	if maxAllowedRev > curRev {
+		maxAllowedRev = curRev
+	}
 
-	// Second pass: filter by revision range (iterate only eligible watchers)
+	// Second filtering: filter eligible watchers by revision range
 	ret := newWatcherGroup()
-	count := 0
 
 	limit := 20
 	type info struct {
@@ -314,30 +310,31 @@ func (wg *watcherGroup) selectForSync(maxWatchers int, curRev, compactRev int64)
 	var minRevs []info
 
 	for _, w := range eligibleWatchers {
-		if w.minRev > maxRevForBatch {
+		// Skip watchers that are behind but outside the revision range window.
+		// However, always include watchers watching for future events (minRev > curRev)
+		// so they can be moved to synced when no events match.
+		if w.minRev > maxAllowedRev && w.minRev <= curRev {
 			continue
 		}
-
 		ret.add(w)
-		count++
 		if len(minRevs) < limit {
 			minRevs = append(minRevs, info{watchId: int(w.id), watcherMinRev: w.minRev})
 		}
-		if count >= maxWatchers {
+		if ret.size() >= maxWatchers {
 			break
 		}
 	}
 
-	fmt.Printf("selected %d for sync (revRange [%d, %d])\n", count, globalMinRev, maxRevForBatch)
+	fmt.Printf("selected %d for sync (revRange [%d, %d])\n", ret.size(), globalMinRev, maxAllowedRev)
 	for _, entry := range minRevs {
 		fmt.Printf("watchId %d minRev %d | ", entry.watchId, entry.watcherMinRev)
 	}
 	fmt.Printf("\n")
 
-	if count == 0 {
-		return nil, globalMinRev
+	if ret.size() == 0 {
+		return nil, globalMinRev, 0
 	}
-	return &ret, globalMinRev
+	return &ret, globalMinRev, maxAllowedRev
 }
 
 // watcherSetByKey gets the set of watchers that receive events on the given key.
